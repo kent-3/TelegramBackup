@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import time
 import json
 import sqlite3
@@ -8,6 +9,7 @@ import warnings
 import csv
 import hashlib
 import datetime
+from dotenv import load_dotenv
 from telethon import TelegramClient, events, errors
 from telethon.tl.types import User, Channel, Chat, ChannelForbidden, MessageMediaWebPage
 from jinja2 import Environment, FileSystemLoader
@@ -16,8 +18,20 @@ from telethon.tl.functions.contacts import GetContactsRequest
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
-api_id = 12345678
-api_hash = "abcdef1234567890abcdef1234567890"
+# Load credentials from .env file or environment variables
+load_dotenv()
+
+api_id = os.environ.get("TELEGRAM_API_ID")
+api_hash = os.environ.get("TELEGRAM_API_HASH")
+
+if not api_id or not api_hash:
+    print("Error: TELEGRAM_API_ID and TELEGRAM_API_HASH must be set.")
+    print("Set them as environment variables or create a .env file with:")
+    print("  TELEGRAM_API_ID=12345678")
+    print('  TELEGRAM_API_HASH=abcdef1234567890abcdef1234567890')
+    sys.exit(1)
+
+api_id = int(api_id)
 
 def get_url_from_forwarded(forwarded):
     if forwarded is None:
@@ -114,20 +128,28 @@ async def get_contacts(client, phone_number):
         print(f"Error getting contacts: {str(e)}")
         return []
 
-async def close_current_session(client):
-    print("Closing current session...")
+async def disconnect_session(client):
+    """Disconnect from Telegram without logging out (preserves session for next run)."""
+    print("Disconnecting...")
     try:
-        await asyncio.sleep(5)
-        await delete_telegram_service_messages(client)
-        
-        await client.log_out()
-        print("Current session closed successfully.")
+        await client.disconnect()
+        print("Disconnected. Session preserved for next run.")
         return True
     except Exception as e:
-        print(f"Error closing session: {str(e)}")
+        print(f"Error disconnecting: {str(e)}")
+        return False
+
+async def logout_session(client):
+    """Fully log out from Telegram (destroys session, requires re-auth next run)."""
+    print("Logging out (session will be destroyed)...")
+    try:
+        await client.log_out()
+        print("Logged out. You will need to re-authenticate next time.")
+        return True
+    except Exception as e:
+        print(f"Error logging out: {str(e)}")
         try:
             await client.disconnect()
-            print("Disconnected but could not log out completely.")
         except:
             pass
         return False
@@ -175,8 +197,6 @@ async def main():
     await client.start(phone=phone_number)
     me = await client.get_me()
     print(f"Session started as {me.first_name}")
-    
-    await delete_telegram_service_messages(client)
     
     await get_contacts(client, phone_number)
 
@@ -232,7 +252,7 @@ async def main():
     print(f"\nThe entity list has been saved in '{entities_filename}'")
 
     while True:
-        choice = input("\nWhat would you like to do?\n[E] Process specific entity\n[T] Process all entities\n[U] Update existing backup\n[D] Delete Telegram service messages\n[X] Close current session\n[S] Exit\nOption: ").lower()
+        choice = input("\nWhat would you like to do?\n[E] Process specific entity\n[T] Process all entities\n[U] Update existing backup\n[P] Export participants from a group/channel\n[D] Delete Telegram service messages\n[X] Logout (destroy session)\n[S] Exit\nOption: ").lower()
         
         if choice == 'e':
             selected_index = int(input("Enter the number corresponding to the entity you want to process: "))
@@ -254,30 +274,32 @@ async def main():
             flat_entities = [entity for category in entities.values() for entity in category]
             download_media = input("Do you want to download media files? (Y/N): ").lower() == 'y'
             await update_entity(client, *flat_entities[selected_index], download_media=download_media)
+        elif choice == 'p':
+            selected_index = int(input("Enter the number corresponding to the group/channel: "))
+            flat_entities = [entity for category in entities.values() for entity in category]
+            await export_participants(client, *flat_entities[selected_index])
         elif choice == 'd':
             await delete_telegram_service_messages(client)
         elif choice == 'x':
-            session_closed = await close_current_session(client)
-            if session_closed:
-                print("Program terminated due to session closure.")
+            confirm = input("This will destroy your session and require re-authentication next time. Continue? (Y/N): ").lower()
+            if confirm == 'y':
+                await logout_session(client)
+                print("Program terminated due to logout.")
                 return
         elif choice == 's':
-            print("\nAutomatically closing session before exiting...")
-            await close_current_session(client)
+            await disconnect_session(client)
             break
 
-        if choice != 's':
+        if choice not in ('s', 'x'):
             continue_processing = input("\nDo you want to perform another operation? (Y/N): ").lower()
             if continue_processing != 'y':
-                print("\nAutomatically closing session before exiting...")
-                await close_current_session(client)
+                await disconnect_session(client)
                 break
 
     print("Program terminated. Thank you for using the Telegram extractor!")
     
     if client.is_connected():
-        print("Closing session before exiting...")
-        await close_current_session(client)
+        await disconnect_session(client)
 
 async def media_exists(cursor, entity_id, message_id, media_type):
     cursor.execute("SELECT media_file FROM messages WHERE id = ? AND entity_id = ? AND media_type = ?", 
@@ -350,6 +372,65 @@ async def get_channel_name_from_message(client, message):
     except Exception as e:
         print(f"Error getting channel name: {str(e)}")
     return None
+
+async def export_participants(client, entity_id, entity_name, entity):
+    """Export the participant/member list of a group or channel to CSV."""
+    if isinstance(entity, User):
+        print(f"{entity_name} is a private user chat, not a group/channel. Skipping.")
+        return
+
+    if isinstance(entity, ChannelForbidden):
+        print(f"{entity_name} (ID: {entity_id}) is not accessible.")
+        return
+
+    print(f"\nExporting participants from: {entity_name} (ID: {entity_id})")
+
+    sanitized_name = sanitize_filename(f"{entity_id}_{entity_name}")
+    csv_filename = f"participants_{sanitized_name}.csv"
+
+    participants = []
+    try:
+        async for user in client.iter_participants(entity):
+            first_name = user.first_name or ""
+            last_name = user.last_name or ""
+            name = f"{first_name} {last_name}".strip() or "No name"
+            phone = user.phone or "Private"
+            username = f"@{user.username}" if user.username else "No username"
+            bot = user.bot if hasattr(user, 'bot') else False
+            status = ""
+            if hasattr(user, 'status') and user.status:
+                status = type(user.status).__name__.replace("UserStatus", "")
+
+            participants.append({
+                'id': user.id,
+                'name': name,
+                'phone': phone,
+                'username': username,
+                'bot': bot,
+                'status': status,
+            })
+
+            print(f"  {name} | {username} | ID: {user.id}", end='\r')
+
+    except errors.ChatAdminRequiredError:
+        print(f"Cannot export participants: admin privileges required for {entity_name}.")
+        return
+    except errors.ChannelPrivateError:
+        print(f"Cannot access {entity_name}. It may be private or you may have been banned.")
+        return
+    except Exception as e:
+        print(f"Error fetching participants: {e}")
+        if not participants:
+            return
+
+    with open(csv_filename, "w", encoding="utf-8-sig", newline='') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        csv_writer.writerow(["Index", "Name", "Phone", "Username", "ID", "Bot", "Status"])
+        for i, p in enumerate(participants):
+            csv_writer.writerow([i, p['name'], p['phone'], p['username'], p['id'], p['bot'], p['status']])
+
+    print(f"\n{len(participants)} participants exported to '{csv_filename}'")
+
 
 async def process_entity(client, entity_id, entity_name, entity, limit=None, download_media=False):
     print(f"\nProcessing: {entity_name} (ID: {entity_id})")
